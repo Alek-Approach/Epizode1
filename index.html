@@ -79,6 +79,14 @@ button:disabled { opacity: .45; cursor: default; }
 button:focus-visible { outline: 3px solid var(--ink); outline-offset: 2px; }
 .wide { grid-column: 1 / -1; }
 .take { grid-column: 1 / -1; font-size: 14px; color: var(--muted); margin: 0; text-align: center; }
+.mic { grid-column: 1 / -1; display: flex; align-items: center; gap: 10px; font-size: 14px; color: var(--muted); }
+.mic label { display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+.mic select { font: inherit; font-size: 14px; color: var(--ink); background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; }
+.meter { flex: 1; height: 10px; border-radius: 5px; background: var(--line); overflow: hidden; position: relative; }
+.meter i { position: absolute; inset: 0; background: var(--gold); transform-origin: 0 50%; transform: scaleX(0); }
+.meter.hot i { background: var(--rec); }
+.fallback { grid-column: 1 / -1; text-align: center; font-size: 15px; font-weight: 700; color: var(--gold); }
+.fallback[hidden] { display: none; }
 @media (prefers-reduced-motion: reduce) { .count span { font-size: 120px; } }
 </style>
 </head>
@@ -109,7 +117,19 @@ button:focus-visible { outline: 3px solid var(--ink); outline-offset: 2px; }
     <button class="danger wide" id="btnStop" hidden>Stop</button>
     <button id="btnPlay" hidden>Play take</button>
     <button class="primary" id="btnSave" hidden>Save audio file</button>
+    <a class="fallback" id="saveLink" hidden>Tap here to download the file</a>
     <p class="take" id="takeInfo" hidden></p>
+    <div class="mic">
+      <label for="boost">Mic boost
+        <select id="boost">
+          <option value="1">Low</option>
+          <option value="2" selected>Medium</option>
+          <option value="3.5">High</option>
+          <option value="6">Max</option>
+        </select>
+      </label>
+      <div class="meter" id="meter" title="Mic level: aim for the bar to reach about 3/4 when you speak"><i></i></div>
+    </div>
   </div>
 </div>
 <div class="count" id="count" aria-live="assertive"><span id="countNum">3</span></div>
@@ -146,7 +166,8 @@ SCENES.forEach(s => {
 const $ = id => document.getElementById(id);
 const els = { time: $('time'), state: $('state'), track: $('track'), sceneName: $('sceneName'), sceneLeft: $('sceneLeft'),
   script: $('script'), cue: $('cue'), next: $('next'), msg: $('msg'), count: $('count'), countNum: $('countNum'),
-  rec: $('btnRec'), practice: $('btnPractice'), stop: $('btnStop'), play: $('btnPlay'), save: $('btnSave'), takeInfo: $('takeInfo') };
+  rec: $('btnRec'), practice: $('btnPractice'), stop: $('btnStop'), play: $('btnPlay'), save: $('btnSave'), takeInfo: $('takeInfo'),
+  boost: $('boost'), meter: $('meter') };
 
 // timeline segments
 const segFills = SCENES.map((s, i) => {
@@ -201,6 +222,7 @@ function setButtons(phase) {
   const busy = phase === 'running' || phase === 'count';
   els.rec.hidden = busy; els.practice.hidden = busy; els.stop.hidden = phase !== 'running';
   els.play.hidden = busy || !take; els.save.hidden = busy || !take; els.takeInfo.hidden = busy || !take;
+  if (busy || !take) $('saveLink').hidden = true;
   els.rec.textContent = take ? 'Record again' : 'Record take';
 }
 
@@ -227,6 +249,53 @@ function pickType() {
   for (const [m, e] of opts) if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(m)) return [m, e];
   return ['', 'webm'];
 }
+
+// The phone's own noise suppression and auto-gain make voices quiet and muffled, so take the clean mic
+// signal and do the processing here: cut rumble, boost, even out loud and soft words, and stop clipping.
+let actx = null, boostNode = null, analyser = null, procStream = null, meterRaf = 0;
+async function openMic() {
+  if (!stream) {
+    const want = { echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1, sampleRate: 48000 };
+    try { stream = await navigator.mediaDevices.getUserMedia({ audio: want }); }
+    catch (e) { if (e && e.name === 'NotAllowedError') throw e; stream = await navigator.mediaDevices.getUserMedia({ audio: true }); }
+  }
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return stream;
+  if (!actx) {
+    try { actx = new AC({ sampleRate: 48000 }); } catch (e) { actx = new AC(); }
+    const src = actx.createMediaStreamSource(stream);
+    const hp = actx.createBiquadFilter(); hp.type = 'highpass'; hp.frequency.value = 80; hp.Q.value = 0.7;
+    const presence = actx.createBiquadFilter(); presence.type = 'peaking'; presence.frequency.value = 3500; presence.Q.value = 0.9; presence.gain.value = 3;
+    boostNode = actx.createGain(); boostNode.gain.value = Number(els.boost.value);
+    const comp = actx.createDynamicsCompressor();
+    comp.threshold.value = -26; comp.knee.value = 10; comp.ratio.value = 4; comp.attack.value = 0.004; comp.release.value = 0.2;
+    const makeup = actx.createGain(); makeup.gain.value = 2;
+    const limiter = actx.createDynamicsCompressor();
+    limiter.threshold.value = -2; limiter.knee.value = 0; limiter.ratio.value = 20; limiter.attack.value = 0.001; limiter.release.value = 0.08;
+    analyser = actx.createAnalyser(); analyser.fftSize = 1024;
+    const dest = actx.createMediaStreamDestination(); dest.channelCount = 1;
+    src.connect(hp); hp.connect(presence); presence.connect(boostNode); boostNode.connect(comp);
+    comp.connect(makeup); makeup.connect(limiter); limiter.connect(dest); limiter.connect(analyser);
+    procStream = dest.stream;
+    startMeter();
+  }
+  if (actx.state !== 'running') { try { await actx.resume(); } catch (e) {} }
+  return procStream || stream;
+}
+function startMeter() {
+  const buf = new Float32Array(analyser.fftSize), bar = els.meter.firstElementChild;
+  let shown = 0;
+  const tick = () => {
+    analyser.getFloatTimeDomainData(buf);
+    let peak = 0; for (let i = 0; i < buf.length; i++) { const v = Math.abs(buf[i]); if (v > peak) peak = v; }
+    shown = Math.max(peak, shown * 0.9);
+    bar.style.transform = 'scaleX(' + Math.min(1, shown) + ')';
+    els.meter.classList.toggle('hot', shown > 0.95);
+    meterRaf = requestAnimationFrame(tick);
+  };
+  tick();
+}
+els.boost.addEventListener('change', () => { if (boostNode) boostNode.gain.setTargetAtTime(Number(els.boost.value), actx.currentTime, 0.05); });
 els.rec.addEventListener('click', async () => {
   showMsg('');
   const type = pickType();
@@ -234,15 +303,19 @@ els.rec.addEventListener('click', async () => {
     showMsg('This view can’t record audio. Use Practice run while your phone’s voice recorder runs, then trim the start of that recording to the moment the timer hits 0:00.');
     return;
   }
+  let recStream;
   try {
-    if (!stream) stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: true, autoGainControl: true } });
+    recStream = await openMic();
   } catch (e) {
     showMsg('The microphone is blocked here (' + (e && e.name ? e.name : 'no access') + '). Allow microphone access for this page, or use Practice run with your phone’s voice recorder and trim to 0:00.');
     return;
   }
   await countdown();
   chunks = [];
-  recorder = type[0] ? new MediaRecorder(stream, { mimeType: type[0] }) : new MediaRecorder(stream);
+  const recOpts = { audioBitsPerSecond: 192000 };
+  if (type[0]) recOpts.mimeType = type[0];
+  try { recorder = new MediaRecorder(recStream, recOpts); }
+  catch (e) { recorder = type[0] ? new MediaRecorder(recStream, { mimeType: type[0] }) : new MediaRecorder(recStream); }
   takeExt = (recorder.mimeType || type[0]).includes('mp4') ? 'mp4' : 'webm';
   recorder.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
   recorder.onstop = () => {
@@ -280,17 +353,43 @@ els.play.addEventListener('click', async () => {
 player.addEventListener('ended', () => { if (mode === 'play') finish(); });
 
 // ---- save ----
-let downloads = null;
-if (window.claude && window.claude.use) window.claude.use('downloads').then(d => { downloads = d; });
+// claude.use() may not exist yet when this script first runs, so ask again at the moment of saving
+let downloadsP = null;
+function getDownloads() {
+  if (!downloadsP) {
+    const c = window.claude;
+    if (!c || !c.use) return Promise.resolve(null);
+    downloadsP = c.use('downloads').catch(() => null);
+  }
+  return downloadsP;
+}
+setTimeout(getDownloads, 0);
+
+// when the in-page save isn't available, fall back to the phone's share sheet, then to a plain download link
+async function fallbackSave(filename) {
+  const file = new File([take], filename, { type: take.type || 'audio/' + takeExt });
+  if (navigator.canShare && navigator.share && navigator.canShare({ files: [file] })) {
+    try { await navigator.share({ files: [file], title: filename }); showMsg('Choose “Save to Files” (iPhone) or your Drive/Files app. Then drop it at 0:00 of the video in CapCut or InShot.'); return; }
+    catch (e) { if (e && e.name === 'AbortError') return; }
+  }
+  const a = $('saveLink');
+  a.href = takeUrl; a.download = filename; a.hidden = false;
+  try { a.click(); } catch (e) {}
+  showMsg('If the download didn’t start, tap the link above. On iPhone, open the page in Safari if it still won’t save.');
+}
+
 els.save.addEventListener('click', async () => {
   if (!take) return;
-  if (!downloads) { showMsg('Saving files isn’t available in this view.'); return; }
+  const filename = 'startup-survival-ep1-voiceover.' + takeExt;
+  const downloads = await getDownloads();
+  if (!downloads) { fallbackSave(filename); return; }
   try {
-    await downloads.save({ filename: 'startup-survival-ep1-voiceover.' + takeExt, data: take });
+    await downloads.save({ filename, data: take });
     showMsg('Saved. Drop it at 0:00 of the video in CapCut or InShot and it will line up.');
   } catch (e) {
     if (e && e.code === 'declined') return;
-    showMsg('The file couldn’t be saved (' + (e && e.code ? e.code : 'error') + ').');
+    if (e && e.code === 'rate_limited') { showMsg('A save window is already open. Finish that one, then tap Save again.'); return; }
+    fallbackSave(filename);
   }
 });
 
